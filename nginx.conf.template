@@ -1,9 +1,14 @@
 worker_processes 1;
-pid /tmp/nginx.pid;
-error_log /tmp/nginx-error.log warn;
+pid /tmp/nginx/nginx.pid;
+error_log /tmp/nginx/error.log warn;
 events { worker_connections 128; }
 http {
     access_log off;
+    client_body_temp_path /tmp/nginx/client;
+    proxy_temp_path /tmp/nginx/proxy;
+    fastcgi_temp_path /tmp/nginx/fastcgi;
+    uwsgi_temp_path /tmp/nginx/uwsgi;
+    scgi_temp_path /tmp/nginx/scgi;
     server {
         listen __PORT__;
         # VLESS + WS：透传给本机 Xray（路径不变）
