@@ -1,10 +1,16 @@
-// 港上后端 + 合并订阅服务（零依赖，Node 内置 http）
+// 港上后端 + 合并订阅服务 + xray WS 反代（零依赖，Node 内置 http/net）
 // 域名一律取请求 Host 头，绝不硬编码；UUID/WS 路径取环境变量。
+// 2026-11-09 改版：去掉 nginx——平台以非 root 用户运行容器，nginx 读配置前 chown
+// 临时目录会报 Operation not permitted 而退出。改由 Node 直接监听 $PORT：
+//  - WS 路径的 Upgrade 请求：原样重建 HTTP 升级请求头，裸 TCP 透传给本机 xray(10000)，
+//    由 xray 自己完成 WebSocket 握手；
+//  - 其余请求：管理后台 / 核验接口 / 订阅。
 // 案件台账尚未接入：/api/verify 目前为平台验证桩，返回明确标注的演示结果；
 // 台账（用户 Excel 导入）接入是服务器落定后的下一步，不在此处伪造数据。
 const http = require('http');
+const net = require('net');
 
-const PORT = 3001;
+const PORT = parseInt(process.env.PORT || '8080', 10);
 const XRAY_UUID = process.env.XRAY_UUID || '';
 const WS_PATH = process.env.XRAY_WS_PATH || '';
 // Cloady 现役节点 v3（与 Cloady 端配置一致，Cloady 节点本身不动）
@@ -50,7 +56,7 @@ proxies:
       path: ${CLOADY.path}
       headers:
         Host: ${CLOADY.server}
-  - name: xray-koyeb
+  - name: xray-orkestr
     type: vless
     server: ${host}
     port: 443
@@ -70,7 +76,7 @@ proxy-groups:
     type: select
     proxies:
       - ${CLOADY.name}
-      - xray-koyeb
+      - xray-orkestr
       - DIRECT
 rules:
   - DOMAIN-SUFFIX,3gppnetwork.org,DIRECT
@@ -81,7 +87,7 @@ rules:
 function subLinks(host) {
   const enc = encodeURIComponent;
   const c = `vless://${CLOADY.uuid}@${CLOADY.server}:443?encryption=none&security=tls&type=ws&host=${CLOADY.server}&path=${enc(CLOADY.path)}#${enc(CLOADY.name)}`;
-  const k = `vless://${XRAY_UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=${enc(WS_PATH)}#${enc('xray-koyeb')}`;
+  const k = `vless://${XRAY_UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=${enc(WS_PATH)}#${enc('xray-orkestr')}`;
   return c + '\n' + k + '\n';
 }
 
@@ -151,4 +157,28 @@ const server = http.createServer((req, res) => {
   res.end('not found\n');
 });
 
-server.listen(PORT, '127.0.0.1', () => console.log('gangshang backend listening on 127.0.0.1:' + PORT));
+// VLESS+WS：把 Upgrade 请求原样重建后裸 TCP 透传给本机 xray，由 xray 完成握手。
+// Node 在 upgrade 事件里已消费掉请求行与请求头，所以用 req.rawHeaders 重建后再透传。
+server.on('upgrade', (req, socket, head) => {
+  let pathname = '';
+  try { pathname = new URL(req.url, 'http://x').pathname; } catch (_) { /* ignore */ }
+  if (pathname !== WS_PATH || !WS_PATH) {
+    socket.destroy();
+    return;
+  }
+  const upstream = net.connect(10000, '127.0.0.1', () => {
+    const lines = [`${req.method} ${req.url} HTTP/1.1`];
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      lines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`);
+    }
+    upstream.write(lines.join('\r\n') + '\r\n\r\n');
+    if (head && head.length) upstream.write(head);
+    socket.pipe(upstream);
+    upstream.pipe(socket);
+  });
+  const kill = () => { try { socket.destroy(); } catch (_) {} try { upstream.destroy(); } catch (_) {} };
+  upstream.on('error', kill);
+  socket.on('error', kill);
+});
+
+server.listen(PORT, '0.0.0.0', () => console.log('gangshang backend listening on 0.0.0.0:' + PORT));
